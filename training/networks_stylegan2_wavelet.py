@@ -19,254 +19,13 @@ from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
 from torch_utils.ops import fma
+from .networks_stylegan2 import normalize_2nd_moment, \
+                               modulated_conv2d, \
+                               FullyConnectedLayer, \
+                               Conv2dLayer, \
+                               MappingNetwork, \
+                               MinibatchStdLayer
 
-#----------------------------------------------------------------------------
-
-@misc.profiled_function
-def normalize_2nd_moment(x, dim=1, eps=1e-8):
-    return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
-
-#----------------------------------------------------------------------------
-
-@misc.profiled_function
-def modulated_conv2d(
-    x,                          # Input tensor of shape [batch_size, in_channels, in_height, in_width].
-    weight,                     # Weight tensor of shape [out_channels, in_channels, kernel_height, kernel_width].
-    styles,                     # Modulation coefficients of shape [batch_size, in_channels].
-    noise           = None,     # Optional noise tensor to add to the output activations.
-    up              = 1,        # Integer upsampling factor.
-    down            = 1,        # Integer downsampling factor.
-    padding         = 0,        # Padding with respect to the upsampled image.
-    resample_filter = None,     # Low-pass filter to apply when resampling activations. Must be prepared beforehand by calling upfirdn2d.setup_filter().
-    demodulate      = True,     # Apply weight demodulation?
-    flip_weight     = True,     # False = convolution, True = correlation (matches torch.nn.functional.conv2d).
-    fused_modconv   = True,     # Perform modulation, convolution, and demodulation as a single fused operation?
-):
-    batch_size = x.shape[0]
-    out_channels, in_channels, kh, kw = weight.shape
-    misc.assert_shape(weight, [out_channels, in_channels, kh, kw]) # [OIkk]
-    misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
-    misc.assert_shape(styles, [batch_size, in_channels]) # [NI]
-
-    # Pre-normalize inputs to avoid FP16 overflow.
-    if x.dtype == torch.float16 and demodulate:
-        weight = weight * (1 / np.sqrt(in_channels * kh * kw) / weight.norm(float('inf'), dim=[1,2,3], keepdim=True)) # max_Ikk
-        styles = styles / styles.norm(float('inf'), dim=1, keepdim=True) # max_I
-
-    # Calculate per-sample weights and demodulation coefficients.
-    w = None
-    dcoefs = None
-    if demodulate or fused_modconv:
-        w = weight.unsqueeze(0) # [NOIkk]
-        w = w * styles.reshape(batch_size, 1, -1, 1, 1) # [NOIkk]
-    if demodulate:
-        dcoefs = (w.square().sum(dim=[2,3,4]) + 1e-8).rsqrt() # [NO]
-    if demodulate and fused_modconv:
-        w = w * dcoefs.reshape(batch_size, -1, 1, 1, 1) # [NOIkk]
-
-    # Execute by scaling the activations before and after the convolution.
-    if not fused_modconv:
-        x = x * styles.to(x.dtype).reshape(batch_size, -1, 1, 1)
-        x = conv2d_resample.conv2d_resample(x=x, w=weight.to(x.dtype), f=resample_filter, up=up, down=down, padding=padding, flip_weight=flip_weight)
-        if demodulate and noise is not None:
-            x = fma.fma(x, dcoefs.to(x.dtype).reshape(batch_size, -1, 1, 1), noise.to(x.dtype))
-        elif demodulate:
-            x = x * dcoefs.to(x.dtype).reshape(batch_size, -1, 1, 1)
-        elif noise is not None:
-            x = x.add_(noise.to(x.dtype))
-        return x
-
-    # Execute as one fused op using grouped convolution.
-    with misc.suppress_tracer_warnings(): # this value will be treated as a constant
-        batch_size = int(batch_size)
-    misc.assert_shape(x, [batch_size, in_channels, None, None])
-    x = x.reshape(1, -1, *x.shape[2:])
-    w = w.reshape(-1, in_channels, kh, kw)
-    x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=resample_filter, up=up, down=down, padding=padding, groups=batch_size, flip_weight=flip_weight)
-    x = x.reshape(batch_size, -1, *x.shape[2:])
-    if noise is not None:
-        x = x.add_(noise)
-    return x
-
-#----------------------------------------------------------------------------
-
-@persistence.persistent_class
-class FullyConnectedLayer(torch.nn.Module):
-    def __init__(self,
-        in_features,                # Number of input features.
-        out_features,               # Number of output features.
-        bias            = True,     # Apply additive bias before the activation function?
-        activation      = 'linear', # Activation function: 'relu', 'lrelu', etc.
-        lr_multiplier   = 1,        # Learning rate multiplier.
-        bias_init       = 0,        # Initial value for the additive bias.
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.activation = activation
-        self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) / lr_multiplier)
-        self.bias = torch.nn.Parameter(torch.full([out_features], np.float32(bias_init))) if bias else None
-        self.weight_gain = lr_multiplier / np.sqrt(in_features)
-        self.bias_gain = lr_multiplier
-
-    def forward(self, x):
-        w = self.weight.to(x.dtype) * self.weight_gain
-        b = self.bias
-        if b is not None:
-            b = b.to(x.dtype)
-            if self.bias_gain != 1:
-                b = b * self.bias_gain
-
-        if self.activation == 'linear' and b is not None:
-            x = torch.addmm(b.unsqueeze(0), x, w.t())
-        else:
-            x = x.matmul(w.t())
-            x = bias_act.bias_act(x, b, act=self.activation)
-        return x
-
-    def extra_repr(self):
-        return f'in_features={self.in_features:d}, out_features={self.out_features:d}, activation={self.activation:s}'
-
-#----------------------------------------------------------------------------
-
-@persistence.persistent_class
-class Conv2dLayer(torch.nn.Module):
-    def __init__(self,
-        in_channels,                    # Number of input channels.
-        out_channels,                   # Number of output channels.
-        kernel_size,                    # Width and height of the convolution kernel.
-        bias            = True,         # Apply additive bias before the activation function?
-        activation      = 'linear',     # Activation function: 'relu', 'lrelu', etc.
-        up              = 1,            # Integer upsampling factor.
-        down            = 1,            # Integer downsampling factor.
-        resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
-        conv_clamp      = None,         # Clamp the output to +-X, None = disable clamping.
-        channels_last   = False,        # Expect the input to have memory_format=channels_last?
-        trainable       = True,         # Update the weights of this layer during training?
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.activation = activation
-        self.up = up
-        self.down = down
-        self.conv_clamp = conv_clamp
-        self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
-        self.padding = kernel_size // 2
-        self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
-        self.act_gain = bias_act.activation_funcs[activation].def_gain
-
-        memory_format = torch.channels_last if channels_last else torch.contiguous_format
-        weight = torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
-        bias = torch.zeros([out_channels]) if bias else None
-        if trainable:
-            self.weight = torch.nn.Parameter(weight)
-            self.bias = torch.nn.Parameter(bias) if bias is not None else None
-        else:
-            self.register_buffer('weight', weight)
-            if bias is not None:
-                self.register_buffer('bias', bias)
-            else:
-                self.bias = None
-
-    def forward(self, x, gain=1):
-        w = self.weight * self.weight_gain
-        b = self.bias.to(x.dtype) if self.bias is not None else None
-        flip_weight = (self.up == 1) # slightly faster
-        x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
-
-        act_gain = self.act_gain * gain
-        act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
-        x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=act_clamp)
-        return x
-
-    def extra_repr(self):
-        return ' '.join([
-            f'in_channels={self.in_channels:d}, out_channels={self.out_channels:d}, activation={self.activation:s},',
-            f'up={self.up}, down={self.down}'])
-
-#----------------------------------------------------------------------------
-
-@persistence.persistent_class
-class MappingNetwork(torch.nn.Module):
-    def __init__(self,
-        z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
-        c_dim,                      # Conditioning label (C) dimensionality, 0 = no label.
-        w_dim,                      # Intermediate latent (W) dimensionality.
-        num_ws,                     # Number of intermediate latents to output, None = do not broadcast.
-        num_layers      = 8,        # Number of mapping layers.
-        embed_features  = None,     # Label embedding dimensionality, None = same as w_dim.
-        layer_features  = None,     # Number of intermediate features in the mapping layers, None = same as w_dim.
-        activation      = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
-        lr_multiplier   = 0.01,     # Learning rate multiplier for the mapping layers.
-        w_avg_beta      = 0.998,    # Decay for tracking the moving average of W during training, None = do not track.
-    ):
-        super().__init__()
-        self.z_dim = z_dim
-        self.c_dim = c_dim
-        self.w_dim = w_dim
-        self.num_ws = num_ws
-        self.num_layers = num_layers
-        self.w_avg_beta = w_avg_beta
-
-        if embed_features is None:
-            embed_features = w_dim
-        if c_dim == 0:
-            embed_features = 0
-        if layer_features is None:
-            layer_features = w_dim
-        features_list = [z_dim + embed_features] + [layer_features] * (num_layers - 1) + [w_dim]
-
-        if c_dim > 0:
-            self.embed = FullyConnectedLayer(c_dim, embed_features)
-        for idx in range(num_layers):
-            in_features = features_list[idx]
-            out_features = features_list[idx + 1]
-            layer = FullyConnectedLayer(in_features, out_features, activation=activation, lr_multiplier=lr_multiplier)
-            setattr(self, f'fc{idx}', layer)
-
-        if num_ws is not None and w_avg_beta is not None:
-            self.register_buffer('w_avg', torch.zeros([w_dim]))
-
-    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
-        # Embed, normalize, and concat inputs.
-        x = None
-        with torch.autograd.profiler.record_function('input'):
-            if self.z_dim > 0:
-                misc.assert_shape(z, [None, self.z_dim])
-                x = normalize_2nd_moment(z.to(torch.float32))
-            if self.c_dim > 0:
-                misc.assert_shape(c, [None, self.c_dim])
-                y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
-                x = torch.cat([x, y], dim=1) if x is not None else y
-
-        # Main layers.
-        for idx in range(self.num_layers):
-            layer = getattr(self, f'fc{idx}')
-            x = layer(x)
-
-        # Update moving average of W.
-        if update_emas and self.w_avg_beta is not None:
-            with torch.autograd.profiler.record_function('update_w_avg'):
-                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
-
-        # Broadcast.
-        if self.num_ws is not None:
-            with torch.autograd.profiler.record_function('broadcast'):
-                x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
-
-        # Apply truncation.
-        if truncation_psi != 1:
-            with torch.autograd.profiler.record_function('truncate'):
-                assert self.w_avg_beta is not None
-                if self.num_ws is None or truncation_cutoff is None:
-                    x = self.w_avg.lerp(x, truncation_psi)
-                else:
-                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
-        return x
-
-    def extra_repr(self):
-        return f'z_dim={self.z_dim:d}, c_dim={self.c_dim:d}, w_dim={self.w_dim:d}, num_ws={self.num_ws:d}'
 
 #----------------------------------------------------------------------------
 
@@ -551,6 +310,147 @@ class Generator(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
+
+def get_wav(in_channels, pool=True):
+    """wavelet decomposition using conv2d"""
+    haar_wav_L = 1 / np.sqrt(2) * np.ones((1, 2))
+    haar_wav_H = 1 / np.sqrt(2) * np.ones((1, 2))
+    haar_wav_H[0, 0] = -1 * haar_wav_H[0, 0]
+
+    haar_wav_LL = np.transpose(haar_wav_L) * haar_wav_L
+    haar_wav_LH = np.transpose(haar_wav_L) * haar_wav_H
+    haar_wav_HL = np.transpose(haar_wav_H) * haar_wav_L
+    haar_wav_HH = np.transpose(haar_wav_H) * haar_wav_H
+
+    filter_LL = torch.from_numpy(haar_wav_LL).unsqueeze(0)
+    filter_LH = torch.from_numpy(haar_wav_LH).unsqueeze(0)
+    filter_HL = torch.from_numpy(haar_wav_HL).unsqueeze(0)
+    filter_HH = torch.from_numpy(haar_wav_HH).unsqueeze(0)
+
+    if pool:
+        net = nn.Conv2d
+    else:
+        net = nn.ConvTranspose2d
+
+    LL = net(in_channels, in_channels,
+             kernel_size=2, stride=2, padding=0, bias=False,
+             groups=in_channels)
+    LH = net(in_channels, in_channels,
+             kernel_size=2, stride=2, padding=0, bias=False,
+             groups=in_channels)
+    HL = net(in_channels, in_channels,
+             kernel_size=2, stride=2, padding=0, bias=False,
+             groups=in_channels)
+    HH = net(in_channels, in_channels,
+             kernel_size=2, stride=2, padding=0, bias=False,
+             groups=in_channels)
+
+    LL.weight.requires_grad = False
+    LH.weight.requires_grad = False
+    HL.weight.requires_grad = False
+    HH.weight.requires_grad = False
+
+    LL.weight.data = filter_LL.float().unsqueeze(0).expand(in_channels, -1, -1, -1)
+    LH.weight.data = filter_LH.float().unsqueeze(0).expand(in_channels, -1, -1, -1)
+    HL.weight.data = filter_HL.float().unsqueeze(0).expand(in_channels, -1, -1, -1)
+    HH.weight.data = filter_HH.float().unsqueeze(0).expand(in_channels, -1, -1, -1)
+
+    return LL, LH, HL, HH
+
+
+class WavePool(torch.nn.Module):
+    def __init__(self, in_channels):
+        super(WavePool, self).__init__()
+        self.LL, self.LH, self.HL, self.HH = get_wav(in_channels)
+
+    def forward(self, x):
+        return self.LL(x), self.LH(x), self.HL(x), self.HH(x)
+
+
+class WaveUnpool(torch.nn.Module):
+    def __init__(self, in_channels, option_unpool='cat5'):
+        super(WaveUnpool, self).__init__()
+        self.in_channels = in_channels
+        self.option_unpool = option_unpool
+        self.LL, self.LH, self.HL, self.HH = get_wav(self.in_channels, pool=False)
+
+    def forward(self, LL, LH, HL, HH, original=None):
+        if self.option_unpool == 'sum':
+            return self.LL(LL) + self.LH(LH) + self.HL(HL) + self.HH(HH)
+        elif self.option_unpool == 'cat5' and original is not None:
+            return torch.cat([self.LL(LL), self.LH(LH), self.HL(HL), self.HH(HH), original], dim=1)
+        else:
+            raise NotImplementedError
+
+
+def get_dwt(x, normalize=True):
+    """
+    DWT (Discrete Wavelet Transform) function implementation according to
+    "Multi-level Wavelet Convolutional Neural Networks"
+    by Pengju Liu, Hongzhi Zhang, Wei Lian, Wangmeng Zuo
+    https://arxiv.org/abs/1907.03128
+       x shape - BCHW (channel first)
+    """
+    x1 = x[:, :, 0::2, 0::2]  # x(2i−1, 2j−1)
+    x2 = x[:, :, 1::2, 0::2]  # x(2i, 2j-1)
+    x3 = x[:, :, 0::2, 1::2]  # x(2i−1, 2j)
+    x4 = x[:, :, 1::2, 1::2]  # x(2i, 2j)
+
+
+    x_LL = x1 + x2 + x3 + x4
+    x_LH = -x1 - x3 + x2 + x4
+    x_HL = -x1 + x3 - x2 + x4
+    x_HH = x1 - x3 - x2 + x4
+
+    wavelets = torch.cat([x_LL,x_LH,x_HL,x_HH], dim=1)
+    if normalize:
+        wavelets /= 4  # TODO: added by mmeshry!
+    return wavelets
+
+
+def get_iwt(x, normalize=True):
+    """
+    IWT (Inverse Wavelet Transfomr) function implementation according to
+    "Multi-level Wavelet Convolutional Neural Networks"
+    by Pengju Liu, Hongzhi Zhang, Wei Lian, Wangmeng Zuo
+    https://arxiv.org/abs/1907.03128
+    x shape - BCHW (channel first)
+    """
+    x = x.permute(0, 2, 3, 1)
+
+    x_LL = x[:, :, :, 0:x.shape[3]//4]
+    x_LH = x[:, :, :, x.shape[3]//4:x.shape[3]//4*2]
+    x_HL = x[:, :, :, x.shape[3]//4*2:x.shape[3]//4*3]
+    x_HH = x[:, :, :, x.shape[3]//4*3:]
+
+    x1 = (x_LL - x_LH - x_HL + x_HH)/4
+    x2 = (x_LL - x_LH + x_HL - x_HH)/4
+    x3 = (x_LL + x_LH - x_HL - x_HH)/4
+    x4 = (x_LL + x_LH + x_HL + x_HH)/4
+
+    y1 = torch.stack([x1, x3], dim=2)
+    y2 = torch.stack([x2, x4], dim=2)
+    shape = x.shape
+    recons = torch.reshape(torch.cat([y1, y2], dim=-1), [-1, shape[1]*2, shape[2]*2, shape[3]//4])
+    recons = recons.permute(0, 3, 1, 2)
+
+    if normalize:
+        recons *= 4  # TODO: added by mmeshry
+    return recons
+
+
+def wavelet_downsample(dwt_img, use_bilinear=True, resample_filter=None, normalize_iwt=True):
+    if not use_bilinear:
+        img = dwt_img[:, 0:3, :, :]  # return the LL component (first 3 channels).
+    else:
+        assert resample_filter is not None
+        img = get_iwt(dwt_img, normalize=normalize_iwt)
+        img = upfirdn2d.downsample2d(img, resample_filter)
+    return get_dwt(img, normalize=normalize_iwt)
+
+
+#----------------------------------------------------------------------------
+
 @persistence.persistent_class
 class DiscriminatorBlock(torch.nn.Module):
     def __init__(self,
@@ -567,9 +467,14 @@ class DiscriminatorBlock(torch.nn.Module):
         use_fp16            = False,        # Use FP16 for this block?
         fp16_channels_last  = False,        # Use channels-last memory format with FP16?
         freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
+        is_wavelet_disc     = True,         # Use a wavelet discrimiator?
+        downscale_bilinear  = True,         # Downscale using bilinear vs LL component of DWT.
+        normalize_dwt       = True,         # Normalize DWT and IWT to have the same magnitude?
     ):
-        assert in_channels in [0, tmp_channels]
+        assert in_channels in [0, tmp_channels], f'in_channels={in_channels}, tmp_channels={tmp_channels}'
         assert architecture in ['orig', 'skip', 'resnet']
+        if is_wavelet_disc:
+            assert architecture == 'skip', 'Only a wavelet `Skip` architecture is currently supported.'
         super().__init__()
         self.in_channels = in_channels
         self.resolution = resolution
@@ -579,6 +484,9 @@ class DiscriminatorBlock(torch.nn.Module):
         self.use_fp16 = use_fp16
         self.channels_last = (use_fp16 and fp16_channels_last)
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+        self.is_wavelet_disc = is_wavelet_disc
+        self.downscale_bilinear = downscale_bilinear
+        self.normalize_dwt = normalize_dwt
 
         self.num_layers = 0
         def trainable_gen():
@@ -590,7 +498,7 @@ class DiscriminatorBlock(torch.nn.Module):
         trainable_iter = trainable_gen()
 
         if in_channels == 0 or architecture == 'skip':
-            self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
+            self.fromwavelet = Conv2dLayer(img_channels*4, tmp_channels, kernel_size=1, activation=activation,
                 trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
 
         self.conv0 = Conv2dLayer(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
@@ -614,13 +522,24 @@ class DiscriminatorBlock(torch.nn.Module):
             misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
             x = x.to(dtype=dtype, memory_format=memory_format)
 
-        # FromRGB.
+        # FromWavelet.
         if self.in_channels == 0 or self.architecture == 'skip':
-            misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+            misc.assert_shape(img, [None, self.img_channels*4, self.resolution, self.resolution])
             img = img.to(dtype=dtype, memory_format=memory_format)
-            y = self.fromrgb(img)
+            y = self.fromwavelet(img)
             x = x + y if x is not None else y
-            img = upfirdn2d.downsample2d(img, self.resample_filter) if self.architecture == 'skip' else None
+            # img = upfirdn2d.downsample2d(img, self.resample_filter) if self.architecture == 'skip' else None
+            if self.architecture == 'skip':
+                if not self.is_wavelet_disc:
+                    img = upfirdn2d.downsample2d(img, self.resample_filter)
+                else:
+                    img = wavelet_downsample(
+                        img,
+                        use_bilinear=self.downscale_bilinear,
+                        resample_filter=self.resample_filter,
+                        normalize_iwt=self.normalize_dwt)
+            else:
+                img = None
 
         # Main layers.
         if self.architecture == 'resnet':
@@ -641,35 +560,6 @@ class DiscriminatorBlock(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
-class MinibatchStdLayer(torch.nn.Module):
-    def __init__(self, group_size, num_channels=1):
-        super().__init__()
-        self.group_size = group_size
-        self.num_channels = num_channels
-
-    def forward(self, x):
-        N, C, H, W = x.shape
-        with misc.suppress_tracer_warnings(): # as_tensor results are registered as constants
-            G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
-        F = self.num_channels
-        c = C // F
-
-        y = x.reshape(G, -1, F, c, H, W)    # [GnFcHW] Split minibatch N into n groups of size G, and channels C into F groups of size c.
-        y = y - y.mean(dim=0)               # [GnFcHW] Subtract mean over group.
-        y = y.square().mean(dim=0)          # [nFcHW]  Calc variance over group.
-        y = (y + 1e-8).sqrt()               # [nFcHW]  Calc stddev over group.
-        y = y.mean(dim=[2,3,4])             # [nF]     Take average over channels and pixels.
-        y = y.reshape(-1, F, 1, 1)          # [nF11]   Add missing dimensions.
-        y = y.repeat(G, 1, H, W)            # [NFHW]   Replicate over group and pixels.
-        x = torch.cat([x, y], dim=1)        # [NCHW]   Append to input as new channels.
-        return x
-
-    def extra_repr(self):
-        return f'group_size={self.group_size}, num_channels={self.num_channels:d}'
-
-#----------------------------------------------------------------------------
-
-@persistence.persistent_class
 class DiscriminatorEpilogue(torch.nn.Module):
     def __init__(self,
         in_channels,                    # Number of input channels.
@@ -681,17 +571,21 @@ class DiscriminatorEpilogue(torch.nn.Module):
         mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
         activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
         conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        is_wavelet_disc     = True,     # Use a wavelet discrimiator?
     ):
         assert architecture in ['orig', 'skip', 'resnet']
+        if is_wavelet_disc:
+            assert architecture == 'skip', 'Only a wavelet `Skip` architecture is currently supported.'
         super().__init__()
         self.in_channels = in_channels
         self.cmap_dim = cmap_dim
         self.resolution = resolution
         self.img_channels = img_channels
         self.architecture = architecture
+        self.is_wavelet_disc = is_wavelet_disc
 
         if architecture == 'skip':
-            self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
+            self.fromwavelet = Conv2dLayer(img_channels*4, in_channels, kernel_size=1, activation=activation)
         self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
         self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
         self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
@@ -703,12 +597,12 @@ class DiscriminatorEpilogue(torch.nn.Module):
         dtype = torch.float32
         memory_format = torch.contiguous_format
 
-        # FromRGB.
+        # FromWavelet.
         x = x.to(dtype=dtype, memory_format=memory_format)
         if self.architecture == 'skip':
-            misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+            misc.assert_shape(img, [None, self.img_channels*4, self.resolution, self.resolution])
             img = img.to(dtype=dtype, memory_format=memory_format)
-            x = x + self.fromrgb(img)
+            x = x + self.fromwavelet(img)
 
         # Main layers.
         if self.mbstd is not None:
@@ -731,7 +625,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
-class Discriminator(torch.nn.Module):
+class WaveletDiscriminator(torch.nn.Module):
     def __init__(self,
         c_dim,                          # Conditioning label (C) dimensionality.
         img_resolution,                 # Input resolution.
@@ -745,13 +639,18 @@ class Discriminator(torch.nn.Module):
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+        downscale_bilinear  = True,     # Downscale using bilinear vs LL component of DWT.
+        normalize_dwt       = True,     # Normalize DWT and IWT to have the same magnitude?
     ):
         super().__init__()
         self.c_dim = c_dim
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
         self.img_channels = img_channels
-        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        self.normalize_dwt = normalize_dwt
+        # NOTE(mmeshry): since dwt changes the block resolutions by 2.
+        # self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2-1, 2, -1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
@@ -768,16 +667,19 @@ class Discriminator(torch.nn.Module):
             out_channels = channels_dict[res // 2]
             use_fp16 = (res >= fp16_resolution)
             block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
-                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
+                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, is_wavelet_disc=True,
+                downscale_bilinear=downscale_bilinear, normalize_dwt=normalize_dwt,
+                **block_kwargs, **common_kwargs)
             setattr(self, f'b{res}', block)
             cur_layer_idx += block.num_layers
         if c_dim > 0:
             self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
-        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
+        self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, is_wavelet_disc=True, **epilogue_kwargs, **common_kwargs)
 
     def forward(self, img, c, update_emas=False, **block_kwargs):
         _ = update_emas # unused
         x = None
+        img = get_dwt(img, self.normalize_dwt)
         for res in self.block_resolutions:
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
